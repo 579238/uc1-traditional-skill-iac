@@ -1,0 +1,23 @@
+{
+  "skill_name": "uc1-traditional-case-lookup",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Create a traditional Lex-only bot for checking parking ticket status. Users provide ticket number and license plate last 4 digits. Use numeric IDs.",
+      "expected_output": "Bot deployed with CheckStatus (2 slots), SMSOptIn, EndConversation intents. No KB. Phone number working.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Build a library book hold status checker. Patrons call with library card number and PIN to check if their holds are ready.",
+      "expected_output": "Lex bot with PatronsTable, HoldsTable, Lambda handler, Connect flow, phone number.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Create a package delivery status bot for a shipping company. Customers provide tracking number and zip code to verify.",
+      "expected_output": "Traditional IVR with CheckStatus intent, DynamoDB tables, no AI components.",
+      "files": []
+    }
+  ]
+}

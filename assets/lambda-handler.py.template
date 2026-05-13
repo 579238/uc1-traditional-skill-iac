@@ -1,0 +1,242 @@
+"""
+{{USE_CASE_NAME_PASCAL}} Status Lookup - Lambda Handler (Traditional/Lex-Only)
+No Bedrock KB - pure deterministic IVR logic.
+
+Intents:
+- CheckStatus: Verify identity → return case status
+- SMSOptIn: Hardcoded confirmation (no actual SMS)
+- EndConversation: Goodbye
+- FallbackIntent: Unrecognized input
+"""
+
+import json
+import os
+import re
+import boto3
+from decimal import Decimal
+
+# Initialize DynamoDB
+dynamodb = boto3.resource('dynamodb')
+entity_table = dynamodb.Table(os.environ.get('ENTITY_TABLE', '{{USE_CASE_NAME_PASCAL}}{{ENTITY_NAME_PASCAL}}Table'))
+cases_table = dynamodb.Table(os.environ.get('CASES_TABLE', '{{USE_CASE_NAME_PASCAL}}{{CASE_NAME_PASCAL}}Table'))
+
+# Configuration - customize these
+ENTITY_NAME = '{{ENTITY_NAME}}'  # e.g., "veteran", "applicant"
+CASE_NAME = '{{CASE_NAME}}'  # e.g., "claim", "permit"
+ENTITY_ID_FIELD = '{{ENTITY_ID_FIELD}}'  # e.g., "veteranId", "applicantId"
+VERIFICATION_FIELD = '{{VERIFICATION_FIELD}}'  # e.g., "ssnLast4", "dateOfBirth"
+
+
+def decimal_to_native(obj):
+    """Convert DynamoDB Decimal types to native Python types."""
+    if isinstance(obj, Decimal):
+        return int(obj) if obj % 1 == 0 else float(obj)
+    elif isinstance(obj, dict):
+        return {k: decimal_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [decimal_to_native(i) for i in obj]
+    return obj
+
+
+def parse_digits(value):
+    """Extract digits from voice input."""
+    if value is None:
+        return None
+    return re.sub(r'\D', '', str(value))
+
+
+def get_slot_value(slots, slot_name):
+    """Safely extract slot value from Lex event."""
+    if not slots or slot_name not in slots:
+        return None
+    slot = slots[slot_name]
+    if slot and 'value' in slot and slot['value']:
+        return slot['value'].get('interpretedValue')
+    return None
+
+
+def verify_entity(entity_id, verification_value):
+    """Verify entity identity."""
+    try:
+        response = entity_table.get_item(Key={ENTITY_ID_FIELD: entity_id})
+        if 'Item' not in response:
+            return None, f"I couldn't find a {ENTITY_NAME} with that ID. Please check and try again."
+        
+        entity = decimal_to_native(response['Item'])
+        stored_value = parse_digits(entity.get(VERIFICATION_FIELD, ''))
+        provided_value = parse_digits(verification_value)
+        
+        if stored_value != provided_value:
+            return None, "The verification information doesn't match our records. Please try again."
+        
+        return entity, None
+    except Exception as e:
+        print(f"Error verifying {ENTITY_NAME}: {e}")
+        return None, "I'm having trouble looking up your information. Please try again later."
+
+
+def get_cases_for_entity(entity_id):
+    """Get all cases for an entity using GSI."""
+    try:
+        response = cases_table.query(
+            IndexName=f'{ENTITY_ID_FIELD}-index',
+            KeyConditionExpression=f'{ENTITY_ID_FIELD} = :eid',
+            ExpressionAttributeValues={':eid': entity_id}
+        )
+        return decimal_to_native(response.get('Items', []))
+    except Exception as e:
+        print(f"Error getting {CASE_NAME}s: {e}")
+        return []
+
+
+def format_status_response(cases, entity_name):
+    """Format cases into a spoken response."""
+    first_name = entity_name.split()[0] if entity_name else "there"
+    
+    if not cases:
+        return f"I don't see any {CASE_NAME}s on file for you, {first_name}. Is there anything else I can help with?"
+    
+    if len(cases) == 1:
+        case = cases[0]
+        status = case.get('status', 'processing').replace('-', ' ')
+        submitted = case.get('submittedDate', 'recently')
+        
+        # Format date for speech
+        try:
+            from datetime import datetime
+            date_obj = datetime.strptime(submitted, '%Y-%m-%d')
+            submitted = date_obj.strftime('%B %d').replace(' 0', ' ')
+        except:
+            pass
+        
+        response = f"Okay {first_name}, your {CASE_NAME} from {submitted} is currently {status}. "
+        
+        # Add context based on status
+        if case.get('missingDocuments'):
+            docs = ', '.join(case['missingDocuments'])
+            response += f"We're waiting on {docs}. "
+        
+        response += "Would you like to receive a text notification when there's an update?"
+        return response
+    
+    else:
+        # Multiple cases
+        response = f"Okay {first_name}, I found {len(cases)} {CASE_NAME}s. "
+        for i, case in enumerate(cases[:3], 1):
+            status = case.get('status', 'processing').replace('-', ' ')
+            ordinal = ['first', 'second', 'third'][i-1]
+            response += f"Your {ordinal} is {status}. "
+        response += "Would you like to receive text notifications for updates?"
+        return response
+
+
+def close_response(event, message, session_attrs=None):
+    """Return close response."""
+    intent = event['sessionState']['intent'].copy()
+    intent['state'] = 'Fulfilled'
+    return {
+        'sessionState': {
+            'dialogAction': {'type': 'Close'},
+            'intent': intent,
+            'sessionAttributes': session_attrs or event.get('sessionState', {}).get('sessionAttributes', {})
+        },
+        'messages': [{'contentType': 'PlainText', 'content': message}]
+    }
+
+
+def elicit_slot(event, slot_name, message):
+    """Return response to elicit a slot."""
+    intent = event['sessionState']['intent'].copy()
+    intent['state'] = 'InProgress'
+    return {
+        'sessionState': {
+            'dialogAction': {'type': 'ElicitSlot', 'slotToElicit': slot_name},
+            'intent': intent,
+            'sessionAttributes': event.get('sessionState', {}).get('sessionAttributes', {})
+        },
+        'messages': [{'contentType': 'PlainText', 'content': message}]
+    }
+
+
+def delegate(event):
+    """Delegate slot elicitation to Lex."""
+    return {
+        'sessionState': {
+            'dialogAction': {'type': 'Delegate'},
+            'intent': event['sessionState']['intent'].copy(),
+            'sessionAttributes': event.get('sessionState', {}).get('sessionAttributes', {})
+        }
+    }
+
+
+def handle_check_status(event):
+    """Handle CheckStatus intent."""
+    slots = event['sessionState']['intent']['slots']
+    session_attrs = event.get('sessionState', {}).get('sessionAttributes', {}) or {}
+    
+    entity_id_raw = get_slot_value(slots, 'entityId')
+    verification_raw = get_slot_value(slots, 'verificationCode')
+    
+    # Delegate to Lex if slots not filled
+    if not entity_id_raw or not verification_raw:
+        return delegate(event)
+    
+    # Normalize inputs
+    entity_id = parse_digits(entity_id_raw)
+    verification = parse_digits(verification_raw)
+    
+    # Verify identity
+    entity, error = verify_entity(entity_id, verification)
+    if error:
+        return elicit_slot(event, 'verificationCode', error)
+    
+    # Store in session for later
+    session_attrs['entityId'] = entity_id
+    session_attrs['entityName'] = entity.get('name', 'there')
+    
+    # Get cases
+    cases = get_cases_for_entity(entity_id)
+    
+    # Format response
+    response = format_status_response(cases, entity.get('name', 'there'))
+    return close_response(event, response, session_attrs)
+
+
+def handle_sms_optin(event):
+    """Handle SMSOptIn intent - hardcoded confirmation."""
+    session_attrs = event.get('sessionState', {}).get('sessionAttributes', {}) or {}
+    entity_name = session_attrs.get('entityName', 'there').split()[0]
+    
+    message = f"Great {entity_name}, you're all set for notifications. Anytime there's a change to your {CASE_NAME} status, you'll receive a text message. Is there anything else I can help you with?"
+    return close_response(event, message, session_attrs)
+
+
+def handle_end_conversation(event):
+    """Handle EndConversation intent."""
+    return close_response(event, "Thank you for calling. Goodbye!")
+
+
+def handle_fallback(event):
+    """Handle FallbackIntent."""
+    return close_response(event, 
+        f"I'm sorry, I didn't understand that. I can help you check your {CASE_NAME} status or set up text notifications. What would you like to do?")
+
+
+def handler(event, context):
+    """Main Lambda handler."""
+    print(f"Event: {json.dumps(event)}")
+    
+    intent_name = event['sessionState']['intent']['name']
+    
+    handlers = {
+        'CheckStatus': handle_check_status,
+        'SMSOptIn': handle_sms_optin,
+        'EndConversation': handle_end_conversation,
+        'FallbackIntent': handle_fallback
+    }
+    
+    handler_func = handlers.get(intent_name, handle_fallback)
+    response = handler_func(event)
+    
+    print(f"Response: {json.dumps(response)}")
+    return response

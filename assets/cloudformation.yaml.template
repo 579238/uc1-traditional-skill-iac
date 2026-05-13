@@ -1,0 +1,790 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  {{USE_CASE_NAME}} Status Lookup Bot - Traditional Lex-Only Architecture (100% IaC)
+  Deploys IAM, DynamoDB, Lambda, Lex V2 Bot, AND Connect resources in a single stack.
+  No post-deployment API calls required.
+
+Parameters:
+  UseCaseName:
+    Type: String
+    Description: Use case identifier (e.g., va-benefits, building-permit)
+    Default: "{{USE_CASE_NAME}}"
+  
+  EntityName:
+    Type: String
+    Description: Entity being looked up (e.g., veteran, applicant)
+    Default: "{{ENTITY_NAME}}"
+  
+  CaseName:
+    Type: String
+    Description: What you're looking up (e.g., claim, permit)
+    Default: "{{CASE_NAME}}"
+  
+  EntityIdField:
+    Type: String
+    Description: Primary ID field name (e.g., veteranId, applicantId)
+    Default: "{{ENTITY_ID_FIELD}}"
+  
+  VerificationField:
+    Type: String
+    Description: Verification field name (e.g., ssnLast4, dateOfBirth)
+    Default: "{{VERIFICATION_FIELD}}"
+  
+  ConnectInstanceArn:
+    Type: String
+    Description: ARN of the Amazon Connect instance (e.g., arn:aws:connect:us-east-1:123456789012:instance/abc-123)
+    Default: "{{CONNECT_INSTANCE_ARN}}"
+  
+  PhoneNumberCountryCode:
+    Type: String
+    Description: Country code for phone number (US, GB, etc.)
+    Default: "US"
+  
+  PhoneNumberType:
+    Type: String
+    Description: Phone number type (TOLL_FREE or DID)
+    Default: "TOLL_FREE"
+    AllowedValues:
+      - TOLL_FREE
+      - DID
+
+Resources:
+  #============================================================================
+  # IAM Role for Lambda
+  #============================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${UseCaseName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt EntityTable.Arn
+                  - !Sub "${EntityTable.Arn}/index/*"
+                  - !GetAtt CasesTable.Arn
+                  - !Sub "${CasesTable.Arn}/index/*"
+
+  #============================================================================
+  # IAM Role for Lex Bot (custom role - no service-linked role needed)
+  #============================================================================
+  LexBotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${UseCaseName}-lex-bot-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LexRuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                  - comprehend:DetectSentiment
+                Resource: "*"
+
+  #============================================================================
+  # DynamoDB Tables
+  #============================================================================
+  EntityTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${UseCaseName}-${EntityName}s"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: !Ref EntityIdField
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Ref EntityIdField
+          KeyType: HASH
+
+  CasesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${UseCaseName}-${CaseName}s"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: !Sub "${CaseName}Id"
+          AttributeType: S
+        - AttributeName: !Ref EntityIdField
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Sub "${CaseName}Id"
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: !Sub "${EntityIdField}-index"
+          KeySchema:
+            - AttributeName: !Ref EntityIdField
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  #============================================================================
+  # Seed Test Data (Custom Resource)
+  #============================================================================
+  SeedDataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${UseCaseName}-seed-data-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt EntityTable.Arn
+                  - !GetAtt CasesTable.Arn
+
+  SeedDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${UseCaseName}-seed-data"
+      Description: "Seeds test data into DynamoDB tables"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SeedDataRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ENTITY_TABLE: !Ref EntityTable
+          CASES_TABLE: !Ref CasesTable
+          ENTITY_ID_FIELD: !Ref EntityIdField
+          VERIFICATION_FIELD: !Ref VerificationField
+          CASE_NAME: !Ref CaseName
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          
+          def handler(event, context):
+              print(f"Event: {event}")
+              dynamodb = boto3.resource('dynamodb')
+              entity_table = dynamodb.Table(os.environ['ENTITY_TABLE'])
+              cases_table = dynamodb.Table(os.environ['CASES_TABLE'])
+              entity_id_field = os.environ['ENTITY_ID_FIELD']
+              verification_field = os.environ['VERIFICATION_FIELD']
+              case_name = os.environ['CASE_NAME']
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Get test data from resource properties
+                      test_entity = event['ResourceProperties'].get('TestEntity', {})
+                      test_case = event['ResourceProperties'].get('TestCase', {})
+                      
+                      # Seed entity
+                      if test_entity:
+                          entity_table.put_item(Item=test_entity)
+                          print(f"Seeded entity: {test_entity}")
+                      
+                      # Seed case
+                      if test_case:
+                          cases_table.put_item(Item=test_case)
+                          print(f"Seeded case: {test_case}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Test data seeded successfully'
+                      })
+                  else:
+                      # Delete - optionally clean up test data
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'Cleanup skipped'
+                      })
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  SeedTestData:
+    Type: Custom::SeedTestData
+    DependsOn:
+      - EntityTable
+      - CasesTable
+    Properties:
+      ServiceToken: !GetAtt SeedDataFunction.Arn
+      # Test entity data - skill will customize these values
+      TestEntity:
+        "{{ENTITY_ID_FIELD}}": "12345"
+        name: "John Smith"
+        "{{VERIFICATION_FIELD}}": "1234"
+        phone: "+15551234567"
+      # Test case data - skill will customize these values  
+      TestCase:
+        "{{CASE_NAME}}Id": "{{CASE_NAME_UPPER}}-1001"
+        "{{ENTITY_ID_FIELD}}": "12345"
+        status: "in-review"
+        submittedDate: "2024-06-15"
+
+  #============================================================================
+  # Lambda Function
+  #============================================================================
+  FulfillmentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${UseCaseName}-status-fulfillment"
+      Description: !Sub "Lex fulfillment for ${CaseName} status lookup"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENTITY_TABLE: !Ref EntityTable
+          CASES_TABLE: !Ref CasesTable
+          ENTITY_ID_FIELD: !Ref EntityIdField
+          VERIFICATION_FIELD: !Ref VerificationField
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          entity_table = dynamodb.Table(os.environ.get('ENTITY_TABLE'))
+          cases_table = dynamodb.Table(os.environ.get('CASES_TABLE'))
+          ENTITY_ID_FIELD = os.environ.get('ENTITY_ID_FIELD', 'entityId')
+          VERIFICATION_FIELD = os.environ.get('VERIFICATION_FIELD', 'verificationCode')
+
+          def decimal_to_native(obj):
+              if isinstance(obj, Decimal):
+                  return int(obj) if obj % 1 == 0 else float(obj)
+              elif isinstance(obj, dict):
+                  return {k: decimal_to_native(v) for k, v in obj.items()}
+              elif isinstance(obj, list):
+                  return [decimal_to_native(i) for i in obj]
+              return obj
+
+          def get_slot_value(slots, slot_name):
+              if not slots or slot_name not in slots:
+                  return None
+              slot = slots[slot_name]
+              if slot and 'value' in slot and slot['value']:
+                  return slot['value'].get('interpretedValue')
+              return None
+
+          def close(event, state, message, session_attrs=None):
+              intent = event['sessionState']['intent'].copy()
+              intent['state'] = 'Fulfilled' if state == 'Fulfilled' else 'Failed'
+              return {
+                  'sessionState': {
+                      'dialogAction': {'type': 'Close'},
+                      'intent': intent,
+                      'sessionAttributes': session_attrs or event.get('sessionState', {}).get('sessionAttributes', {})
+                  },
+                  'messages': [{'contentType': 'PlainText', 'content': message}]
+              }
+
+          def delegate(event):
+              return {
+                  'sessionState': {
+                      'dialogAction': {'type': 'Delegate'},
+                      'intent': event['sessionState']['intent'].copy(),
+                      'sessionAttributes': event.get('sessionState', {}).get('sessionAttributes', {})
+                  }
+              }
+
+          def handle_check_status(event):
+              slots = event['sessionState']['intent']['slots']
+              entity_id = get_slot_value(slots, 'entityId')
+              verification = get_slot_value(slots, 'verificationCode')
+              
+              if not entity_id or not verification:
+                  return delegate(event)
+              
+              try:
+                  # Look up entity
+                  response = entity_table.get_item(Key={ENTITY_ID_FIELD: entity_id})
+                  if 'Item' not in response:
+                      return close(event, 'Fulfilled', f"I couldn't find a record with that ID. Please check and try again.")
+                  
+                  entity = decimal_to_native(response['Item'])
+                  
+                  # Verify
+                  if str(entity.get(VERIFICATION_FIELD, '')) != str(verification):
+                      return close(event, 'Fulfilled', "The verification code doesn't match our records. Please try again.")
+                  
+                  # Get cases
+                  cases_response = cases_table.query(
+                      IndexName=f'{ENTITY_ID_FIELD}-index',
+                      KeyConditionExpression=f'{ENTITY_ID_FIELD} = :eid',
+                      ExpressionAttributeValues={':eid': entity_id}
+                  )
+                  cases = decimal_to_native(cases_response.get('Items', []))
+                  
+                  name = entity.get('name', 'there').split()[0]
+                  
+                  if not cases:
+                      return close(event, 'Fulfilled', f"I don't see any records on file for you, {name}. Is there anything else I can help with?")
+                  
+                  case = cases[0]
+                  status = case.get('status', 'unknown').replace('-', ' ')
+                  msg = f"Okay {name}, your status is: {status}. Would you like to receive updates when there's a change?"
+                  
+                  return close(event, 'Fulfilled', msg)
+                  
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return close(event, 'Failed', "I'm having trouble looking up your information. Please try again later.")
+
+          def handle_sms_optin(event):
+              return close(event, 'Fulfilled', "You're all set for notifications. Is there anything else I can help you with?")
+
+          def handle_end(event):
+              return close(event, 'Fulfilled', "Thank you for calling. Goodbye!")
+
+          def handle_fallback(event):
+              return close(event, 'Fulfilled', "I can help you check your status. Just say 'check my status' to get started.")
+
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              intent = event['sessionState']['intent']['name']
+              
+              handlers = {
+                  'CheckStatus': handle_check_status,
+                  'SMSOptIn': handle_sms_optin,
+                  'EndConversation': handle_end,
+                  'FallbackIntent': handle_fallback
+              }
+              
+              response = handlers.get(intent, handle_fallback)(event)
+              print(f"Response: {json.dumps(response)}")
+              return response
+
+  # Permission for Lex to invoke Lambda
+  LexLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FulfillmentLambda
+      Action: lambda:InvokeFunction
+      Principal: lexv2.amazonaws.com
+      SourceArn: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/*"
+
+  #============================================================================
+  # Lex V2 Bot
+  #============================================================================
+  LexBot:
+    Type: AWS::Lex::Bot
+    DependsOn: LexBotRole
+    Properties:
+      Name: !Sub "${UseCaseName}-status-bot"
+      Description: !Sub "${CaseName} status lookup bot"
+      RoleArn: !GetAtt LexBotRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      AutoBuildBotLocales: true
+      BotLocales:
+        - LocaleId: en_US
+          NluConfidenceThreshold: 0.4
+          VoiceSettings:
+            VoiceId: Joanna
+            Engine: neural
+          Intents:
+            #------------------------------------------------------------------
+            # CheckStatus Intent - Main lookup flow
+            #------------------------------------------------------------------
+            - Name: CheckStatus
+              Description: !Sub "Look up ${CaseName} status"
+              SampleUtterances:
+                - Utterance: "check my status"
+                - Utterance: !Sub "what is the status of my ${CaseName}"
+                - Utterance: !Sub "I want to check my ${CaseName}"
+                - Utterance: !Sub "${CaseName} status"
+                - Utterance: "check my application"
+                - Utterance: !Sub "where is my ${CaseName}"
+                - Utterance: "look up my status"
+                - Utterance: !Sub "any update on my ${CaseName}"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: entityId
+                - Priority: 2
+                  SlotName: verificationCode
+              Slots:
+                - Name: entityId
+                  SlotTypeName: AMAZON.Number
+                  ValueElicitationSetting:
+                    SlotConstraint: Required
+                    PromptSpecification:
+                      MaxRetries: 2
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: !Sub "Please say your ${EntityName} ID number."
+                - Name: verificationCode
+                  SlotTypeName: AMAZON.Number
+                  ValueElicitationSetting:
+                    SlotConstraint: Required
+                    PromptSpecification:
+                      MaxRetries: 2
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: !Sub "For verification, please provide your ${VerificationField}."
+              FulfillmentCodeHook:
+                Enabled: true
+            
+            #------------------------------------------------------------------
+            # SMSOptIn Intent - Notification signup
+            #------------------------------------------------------------------
+            - Name: SMSOptIn
+              Description: "Opt in for SMS notifications"
+              SampleUtterances:
+                - Utterance: "yes send me a text"
+                - Utterance: "text me"
+                - Utterance: "send me updates"
+                - Utterance: "notify me"
+                - Utterance: "yes text updates"
+                - Utterance: "yes please"
+                - Utterance: "sure"
+                - Utterance: "okay"
+              FulfillmentCodeHook:
+                Enabled: true
+            
+            #------------------------------------------------------------------
+            # EndConversation Intent
+            #------------------------------------------------------------------
+            - Name: EndConversation
+              Description: "End the conversation"
+              SampleUtterances:
+                - Utterance: "goodbye"
+                - Utterance: "bye"
+                - Utterance: "no thanks"
+                - Utterance: "I am done"
+                - Utterance: "that is all"
+                - Utterance: "nothing else"
+                - Utterance: "no"
+              FulfillmentCodeHook:
+                Enabled: true
+            
+            #------------------------------------------------------------------
+            # FallbackIntent - Built-in
+            #------------------------------------------------------------------
+            - Name: FallbackIntent
+              Description: "Handle unrecognized input"
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              FulfillmentCodeHook:
+                Enabled: true
+
+  #============================================================================
+  # Lex Bot Version (triggers build)
+  #============================================================================
+  LexBotVersion:
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref LexBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+
+  #============================================================================
+  # Lex Bot Alias (points to version, connects Lambda)
+  #============================================================================
+  LexBotAlias:
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref LexBot
+      BotAliasName: live
+      BotVersion: !GetAtt LexBotVersion.BotVersion
+      BotAliasLocaleSettings:
+        - LocaleId: en_US
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification:
+              LambdaCodeHook:
+                LambdaArn: !GetAtt FulfillmentLambda.Arn
+                CodeHookInterfaceVersion: "1.0"
+
+  #============================================================================
+  # Connect Integration - Bot Association
+  #============================================================================
+  ConnectBotAssociation:
+    Type: AWS::Connect::IntegrationAssociation
+    DependsOn: LexBotAlias
+    Properties:
+      InstanceId: !Ref ConnectInstanceArn
+      IntegrationType: LEX_BOT
+      IntegrationArn: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/${LexBotAlias.BotAliasId}"
+
+  #============================================================================
+  # Connect Contact Flow
+  #============================================================================
+  ContactFlow:
+    Type: AWS::Connect::ContactFlow
+    DependsOn: ConnectBotAssociation
+    Properties:
+      InstanceArn: !Ref ConnectInstanceArn
+      Name: !Sub "${UseCaseName}-status-flow"
+      Description: !Sub "Contact flow for ${CaseName} status lookup"
+      Type: CONTACT_FLOW
+      State: ACTIVE
+      Content: !Sub |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "SetLogging",
+          "Actions": [
+            {
+              "Identifier": "SetLogging",
+              "Type": "UpdateFlowLoggingBehavior",
+              "Parameters": {"FlowLoggingBehavior": "Enabled"},
+              "Transitions": {"NextAction": "SetVoice"}
+            },
+            {
+              "Identifier": "SetVoice",
+              "Type": "UpdateContactTextToSpeechVoice",
+              "Parameters": {"TextToSpeechEngine": "Neural", "TextToSpeechVoice": "Joanna"},
+              "Transitions": {"NextAction": "Welcome"}
+            },
+            {
+              "Identifier": "Welcome",
+              "Type": "MessageParticipant",
+              "Parameters": {"Text": "Welcome to the ${UseCaseName} status line. How can I help you today?"},
+              "Transitions": {"NextAction": "GetInput", "Errors": [{"ErrorType": "NoMatchingError", "NextAction": "GetInput"}]}
+            },
+            {
+              "Identifier": "GetInput",
+              "Type": "ConnectParticipantWithLexBot",
+              "Parameters": {
+                "Text": " ",
+                "LexV2Bot": {"AliasArn": "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/${LexBotAlias.BotAliasId}"}
+              },
+              "Transitions": {
+                "NextAction": "Error",
+                "Conditions": [{"Condition": {"Operator": "Equals", "Operands": ["EndConversation"]}, "NextAction": "Goodbye"}],
+                "Errors": [{"ErrorType": "NoMatchingCondition", "NextAction": "GetInput"}, {"ErrorType": "NoMatchingError", "NextAction": "Error"}]
+              }
+            },
+            {
+              "Identifier": "Goodbye",
+              "Type": "MessageParticipant",
+              "Parameters": {"Text": "Thank you for calling. Goodbye!"},
+              "Transitions": {"NextAction": "Disconnect", "Errors": [{"ErrorType": "NoMatchingError", "NextAction": "Disconnect"}]}
+            },
+            {
+              "Identifier": "Error",
+              "Type": "MessageParticipant",
+              "Parameters": {"Text": "Sorry, something went wrong. Please try again later."},
+              "Transitions": {"NextAction": "Disconnect", "Errors": [{"ErrorType": "NoMatchingError", "NextAction": "Disconnect"}]}
+            },
+            {
+              "Identifier": "Disconnect",
+              "Type": "DisconnectParticipant",
+              "Parameters": {},
+              "Transitions": {}
+            }
+          ]
+        }
+
+  #============================================================================
+  # Connect Phone Number
+  #============================================================================
+  PhoneNumber:
+    Type: AWS::Connect::PhoneNumber
+    DependsOn: ContactFlow
+    Properties:
+      TargetArn: !Ref ConnectInstanceArn
+      CountryCode: !Ref PhoneNumberCountryCode
+      Type: !Ref PhoneNumberType
+      Description: !Sub "Phone number for ${UseCaseName} status bot"
+
+  #============================================================================
+  # Associate Phone Number with Contact Flow
+  # Note: AWS::Connect::PhoneNumber doesn't directly associate with flow.
+  # We need a custom resource or the user must do this manually.
+  # However, we can use a Lambda-backed custom resource for this.
+  #============================================================================
+  PhoneNumberFlowAssociationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${UseCaseName}-phone-assoc-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConnectPhoneAssociation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:AssociatePhoneNumberContactFlow
+                  - connect:DisassociatePhoneNumberContactFlow
+                  - connect:DescribePhoneNumber
+                Resource: "*"
+
+  PhoneNumberFlowAssociationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${UseCaseName}-phone-flow-assoc"
+      Description: "Associates phone number with contact flow"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PhoneNumberFlowAssociationRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+          
+          def handler(event, context):
+              print(f"Event: {event}")
+              connect = boto3.client('connect')
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      phone_number_id = event['ResourceProperties']['PhoneNumberId']
+                      instance_id = event['ResourceProperties']['InstanceId']
+                      contact_flow_id = event['ResourceProperties']['ContactFlowId']
+                      
+                      # Wait for phone number to be ready
+                      for i in range(12):
+                          try:
+                              response = connect.describe_phone_number(PhoneNumberId=phone_number_id)
+                              status = response['ClaimedPhoneNumberSummary'].get('PhoneNumberStatus', {}).get('Status', 'CLAIMED')
+                              if status == 'CLAIMED':
+                                  break
+                          except:
+                              pass
+                          time.sleep(5)
+                      
+                      connect.associate_phone_number_contact_flow(
+                          PhoneNumberId=phone_number_id,
+                          InstanceId=instance_id,
+                          ContactFlowId=contact_flow_id
+                      )
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'Associated'})
+                  else:
+                      # Delete - just succeed, phone number deletion handles disassociation
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'Deleted'})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  PhoneNumberFlowAssociation:
+    Type: Custom::PhoneNumberFlowAssociation
+    DependsOn: 
+      - PhoneNumber
+      - ContactFlow
+    Properties:
+      ServiceToken: !GetAtt PhoneNumberFlowAssociationFunction.Arn
+      PhoneNumberId: !Select [1, !Split ["/", !Ref PhoneNumber]]
+      InstanceId: !Select [1, !Split ["instance/", !Ref ConnectInstanceArn]]
+      ContactFlowId: !Select [1, !Split ["contact-flow/", !GetAtt ContactFlow.ContactFlowArn]]
+
+#==============================================================================
+# Outputs
+#==============================================================================
+Outputs:
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt FulfillmentLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
+
+  LexBotId:
+    Description: Lex Bot ID
+    Value: !Ref LexBot
+    Export:
+      Name: !Sub "${AWS::StackName}-BotId"
+
+  LexBotAliasId:
+    Description: Lex Bot Alias ID
+    Value: !GetAtt LexBotAlias.BotAliasId
+    Export:
+      Name: !Sub "${AWS::StackName}-AliasId"
+
+  LexBotAliasArn:
+    Description: Lex Bot Alias ARN
+    Value: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${LexBot}/${LexBotAlias.BotAliasId}"
+    Export:
+      Name: !Sub "${AWS::StackName}-BotAliasArn"
+
+  EntityTableName:
+    Description: Entity DynamoDB table name
+    Value: !Ref EntityTable
+    Export:
+      Name: !Sub "${AWS::StackName}-EntityTable"
+
+  CasesTableName:
+    Description: Cases DynamoDB table name
+    Value: !Ref CasesTable
+    Export:
+      Name: !Sub "${AWS::StackName}-CasesTable"
+
+  ContactFlowId:
+    Description: Connect Contact Flow ID
+    Value: !Select [1, !Split ["contact-flow/", !GetAtt ContactFlow.ContactFlowArn]]
+    Export:
+      Name: !Sub "${AWS::StackName}-ContactFlowId"
+
+  ContactFlowArn:
+    Description: Connect Contact Flow ARN
+    Value: !GetAtt ContactFlow.ContactFlowArn
+    Export:
+      Name: !Sub "${AWS::StackName}-ContactFlowArn"
+
+  PhoneNumber:
+    Description: Phone number to call the bot
+    Value: !GetAtt PhoneNumber.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-PhoneNumber"
+
+  PhoneNumberArn:
+    Description: Phone Number ARN
+    Value: !GetAtt PhoneNumber.PhoneNumberArn
+    Export:
+      Name: !Sub "${AWS::StackName}-PhoneNumberArn"
+
+  DeploymentSummary:
+    Description: Deployment complete - all resources created via CloudFormation
+    Value: !Sub |
+      Bot deployed successfully! 
+      Call ${PhoneNumber.Address} to test.
+      Stack: ${AWS::StackName}
+      Region: ${AWS::Region}

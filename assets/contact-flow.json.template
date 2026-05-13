@@ -1,0 +1,100 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "enable-logging",
+  "Metadata": {
+    "description": "{{PROGRAM_NAME}} status lookup contact flow",
+    "status": "published"
+  },
+  "Actions": [
+    {
+      "Parameters": {"FlowLoggingBehavior": "Enabled"},
+      "Identifier": "enable-logging",
+      "Type": "UpdateFlowLoggingBehavior",
+      "Transitions": {"NextAction": "set-voice"}
+    },
+    {
+      "Parameters": {
+        "TextToSpeechVoice": "Joanna",
+        "TextToSpeechEngine": "Neural",
+        "TextToSpeechStyle": "None"
+      },
+      "Identifier": "set-voice",
+      "Type": "UpdateContactTextToSpeechVoice",
+      "Transitions": {"NextAction": "welcome-message"}
+    },
+    {
+      "Parameters": {
+        "Text": "{{WELCOME_MESSAGE}}"
+      },
+      "Identifier": "welcome-message",
+      "Type": "MessageParticipant",
+      "Transitions": {
+        "NextAction": "lex-bot",
+        "Errors": [{"NextAction": "lex-bot", "ErrorType": "NoMatchingError"}]
+      }
+    },
+    {
+      "Parameters": {
+        "Text": " ",
+        "LexV2Bot": {
+          "AliasArn": "{{LEX_BOT_ALIAS_ARN}}"
+        }
+      },
+      "Identifier": "lex-bot",
+      "Type": "ConnectParticipantWithLexBot",
+      "Transitions": {
+        "NextAction": "error-message",
+        "Conditions": [
+          {
+            "NextAction": "goodbye-message",
+            "Condition": {"Operator": "Equals", "Operands": ["EndConversation"]}
+          },
+          {
+            "NextAction": "lex-bot",
+            "Condition": {"Operator": "Equals", "Operands": ["CheckStatus"]}
+          },
+          {
+            "NextAction": "lex-bot",
+            "Condition": {"Operator": "Equals", "Operands": ["AskQuestion"]}
+          },
+          {
+            "NextAction": "lex-bot",
+            "Condition": {"Operator": "Equals", "Operands": ["FallbackIntent"]}
+          }
+        ],
+        "Errors": [
+          {"NextAction": "error-message", "ErrorType": "NoMatchingCondition"},
+          {"NextAction": "error-message", "ErrorType": "NoMatchingError"}
+        ]
+      }
+    },
+    {
+      "Parameters": {
+        "Text": "{{GOODBYE_MESSAGE}}"
+      },
+      "Identifier": "goodbye-message",
+      "Type": "MessageParticipant",
+      "Transitions": {
+        "NextAction": "disconnect",
+        "Errors": [{"NextAction": "disconnect", "ErrorType": "NoMatchingError"}]
+      }
+    },
+    {
+      "Parameters": {
+        "Text": "I'm sorry, I'm having trouble processing your request. Please try again later."
+      },
+      "Identifier": "error-message",
+      "Type": "MessageParticipant",
+      "Transitions": {
+        "NextAction": "disconnect",
+        "Errors": [{"NextAction": "disconnect", "ErrorType": "NoMatchingError"}]
+      }
+    },
+    {
+      "Parameters": {},
+      "Identifier": "disconnect",
+      "Type": "DisconnectParticipant",
+      "Transitions": {}
+    }
+  ]
+}

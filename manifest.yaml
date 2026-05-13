@@ -1,0 +1,56 @@
+# ──────────────────────────────────────────────────────────────
+# MaxAI Artifacts Library – manifest.yaml v4
+# ──────────────────────────────────────────────────────────────
+# UC1 Traditional: Case/Status Lookup Bot (Lex-Only IaC)
+# ──────────────────────────────────────────────────────────────
+
+# ── REQUIRED ─────────────────────────────────────────────────
+
+id: uc1-traditional-case-lookup-iac
+name: "Traditional Case/Status Lookup Bot (Lex-Only IaC)"
+description: >
+  Deploy a complete voice-based case status lookup system using
+  Amazon Connect, Lex V2, Lambda, and DynamoDB — all via a single
+  CloudFormation stack. No AI or Bedrock required. The traditional
+  Lex-only approach provides deterministic IVR logic for any
+  entity-plus-verification lookup pattern: claims, permits,
+  applications, tickets. 100% Infrastructure as Code with single
+  stack deploy and single stack delete.
+version: 1
+type: skill
+tags:
+  - voice-bot
+  - lex
+  - iac
+  - ivr
+  - contact-center
+  - case-lookup
+
+use_cases:
+  - "Build a phone-based status check bot for claims, permits, applications, or tickets"
+  - "Deploy a complete Connect + Lex + Lambda + DynamoDB voice bot with a single CloudFormation stack"
+  - "Create a deterministic IVR flow that verifies caller identity and reads back case status"
+  - "Stand up a traditional Lex-only voice bot without any AI or Bedrock dependency"
+  - "Automate the entire infrastructure for a lookup bot including phone number provisioning"
+
+# ── RECOMMENDED ──────────────────────────────────────────────
+
+solves_problems:
+  - "No quick way to stand up a working voice bot for simple ID-plus-verification status lookups"
+  - "Manual and fragile process of wiring Connect, Lex, Lambda, DynamoDB, and phone numbers together"
+  - "Teams defaulting to AI-powered solutions when a simpler deterministic IVR would suffice"
+  - "Difficulty tearing down and redeploying voice bot infrastructure cleanly during development"
+
+# ── OPTIONAL ─────────────────────────────────────────────────
+
+platform:
+  - amazon-connect
+  - aws
+owner: Nithesh Sivakumar
+team: cx-solutions
+github_url: https://github.com/579238/uc1-traditional-skill-iac
+created_at: "2026-05-12"
+changelog:
+  - version: 1
+    date: "2026-05-12"
+    changes: "Initial release — single-stack CloudFormation deploy with Connect, Lex V2, Lambda, DynamoDB, and phone number provisioning"
